@@ -1,0 +1,21 @@
+# Reduces mbedTLS's default ~32KB (16KB in + 16KB out) TLS record buffers.
+# Sized against REAL measured data from HeapDiag logging (not guessed):
+#   - Internal free after MQTT queue init + WiFi connect: ~28-37KB
+#     (37KB after the MQTT_TX_QUEUE_DEPTH 8→4 reduction)
+#   - MQTT_TLS_MIN_FREE_HEAP=45000 derives from default 32KB record
+#     buffers + ~10-13KB handshake overhead — confirmed by the numbers
+#     lining up almost exactly.
+# IN=4096: must fit the server's cert chain in one record. MQTT_ROOT_CA
+#   is a single, moderate-size cert — 4096 gives real margin, not a
+#   tight fit.
+# OUT=2048: client only sends small messages (ClientHello, key exchange,
+#   Finished) — doesn't need IN-sized headroom. Standard ESP32 client
+#   pattern.
+# Net: recovers ~26.6KB vs the 32KB default, dropping the real minimum
+# requirement from ~45KB to roughly ~18-20KB — comfortably under the
+# measured ~28-37KB baseline. See Config.h MQTT_TLS_MIN_FREE_HEAP, which
+# is recalculated to match (not left at the old, now-stale 45000).
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_ASYMMETRIC_CONTENT_LEN=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=4096
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048

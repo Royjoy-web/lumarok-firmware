@@ -27,6 +27,7 @@
 class BatchPublisher {
 public:
     static void init() {
+        if (_mutex) return;  // idempotent — may be called from setup() and again from NetworkTaskV2
         _mutex     = xSemaphoreCreateMutex();
         configASSERT(_mutex);
         _count     = 0;

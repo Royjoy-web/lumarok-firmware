@@ -1,5 +1,64 @@
+// ── ArduinoDroid dependency-scanner workaround ──────────────────
+// ArduinoDroid's "Analyzing sketch dependencies" step only detects
+// libraries from #include lines in THIS .ino file — not from includes
+// nested inside this project's own .h files, however many levels deep.
+// Without these direct includes here, ArduinoDroid compiles headers fine
+// but never builds librariesBuild/ for these libraries, so every symbol
+// from them is "undefined reference" at link time. Harmless under
+// PlatformIO (which doesn't have this limitation) — keeping both build
+// trees identical avoids drift.
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <Update.h>
+#include <Wire.h>
+#include <ArduinoJson.h>
+#include <DHT.h>
+#include <ESP32Servo.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
+#include <ir_Daikin.h>
+#include <ir_Mitsubishi.h>
+#include <ir_Gree.h>
+#include <Adafruit_Fingerprint.h>
+
+// PZEM library is only required when ENABLE_PZEM is on (defaults false, set
+// via Phase2Config.h normally — but that hasn't been included yet at this
+// point in the file, hence the local default here). Matches the same
+// ENABLE_PZEM gate already used around the real driver code in
+// Phase2Drivers.h. If you don't have a PZEM-004T wired up, leave this off
+// and you don't need the library installed at all.
+#ifndef ENABLE_PZEM
+  #define ENABLE_PZEM false
+#endif
+#if ENABLE_PZEM
+  #include <PZEM004Tv30.h>
+#endif
+
+// HIL test override: no physical AS608 fingerprint sensor is wired to this
+// test unit. Two independent app-level fixes to FingerprintDriver.h (a
+// scan-loop guard, then a full rewrite with UART-driver-install checks,
+// readiness tracking, and a mutex) both failed to stop a crash that occurs
+// with an identical call-chain every time — meaning the fault sits below
+// application code, inside the Adafruit library or ESP-IDF UART internals
+// when nothing physically answers on the wire. Root-causing that requires
+// hardware-in-the-loop debugging (logic analyzer or a real sensor
+// attached), not further blind app-layer patching. Disabling until either
+// is available; re-enable once a real AS608 is wired up.
+#ifndef ENABLE_FINGERPRINT
+  #define ENABLE_FINGERPRINT false
+#endif
+
 // ═══════════════════════════════════════════════════════════════
-//  LumaRoK C10 — Enterprise Hardened Firmware v3.2.0
+//  LumaRoK C10 — Enterprise Hardened Firmware v4.2.0-P2
 // ═══════════════════════════════════════════════════════════════
 
 // ── Core ──────────────────────────────────────────────────────
@@ -32,9 +91,10 @@
 // ── Networking & MQTT ─────────────────────────────────────────
 #include "networking/WiFiManager.h"
 #include "networking/ReconnectEngine.h"
+#include "networking/LocalCommandServer.h"   // Phase 1: local (LAN) control path
 #include "mqtt/MQTTTopics.h"
 #include "mqtt/MQTTTransport.h"
-#include "mqtt/CommandDispatcher.h"
+// Note: CommandDispatcher.h moved below SensorTaskV2_P2.h so Phase2Drivers are available
 
 // ── Telemetry ─────────────────────────────────────────────────
 #include "telemetry/TimeSync.h"
@@ -65,7 +125,8 @@
 
 // ── Tasks (V2 hardened) ───────────────────────────────────────
 #include "tasks/SafetyTask.h"
-#include "tasks/SensorTaskV2.h"
+#include "tasks/SensorTaskV2_P2.h"   // pulls Phase2Config/Drivers/Advanced internally
+#include "mqtt/CommandDispatcher.h"     // after P2 drivers so ENABLE_RGBW flag is resolved
 #include "tasks/NetworkTaskV2.h"
 #include "tasks/ActuatorTask.h"
 #include "tasks/MQTTTasks.h"
@@ -82,7 +143,7 @@ void runProvisioningFlow();
 void setup() {
     Serial.begin(SERIAL_BAUD);
     delay(200);
-    LOG_I("Main", "LumaRoK v3.2.0 (hardened)  HW:%s", HARDWARE_REVISION);
+    LOG_I("Main", "LumaRoK v4.2.0-P2 (hardened)  HW:%s", HARDWARE_REVISION);
 
     // ── 1. Identity ───────────────────────────────────────────
     Identity::init();
@@ -107,6 +168,21 @@ void setup() {
     // ── 6. Memory pools ───────────────────────────────────────
     gSensorPool.init();
     gAlertPool.init();
+
+    // FIX (startup race): BatchPublisher's mutex must exist before ANY
+    // task can call stage()/flush(). It was previously only created inside
+    // NetworkTaskV2's networkTaskFnV2(), behind a deliberate 3s settle
+    // delay (see FIX (heap audit) comment there) — but SensorTaskV2's DHT
+    // block calls BatchPublisher::stage()/flush() on its very first loop
+    // iteration (its `lastDHT` timer starts at 0, so it fires immediately),
+    // which reliably lands before that 3s delay elapses. Taking an
+    // uninitialized (null) FreeRTOS semaphore hits the exact same assert
+    // as a null queue — semaphores are queues internally — i.e.
+    // "assert failed: xQueueSemaphoreTake queue.c:1709 (( pxQueue ))".
+    // Creating the mutex here, before any task starts, removes the race.
+    // BatchPublisher::init() is idempotent — safe to also still run
+    // unchanged inside NetworkTaskV2.
+    BatchPublisher::init();
 
     // ── 7. Hardware WDT ───────────────────────────────────────
     TaskManager::initWatchdog();
@@ -139,6 +215,7 @@ void setup() {
           (int)BootManager::mode());
 
     // ── 11. Launch tasks ──────────────────────────────────────
+    // WiFiRoaming::init() handled inside SensorTaskV2_P2 init block
     TaskManagerV2::startAll();
     LOG_I("Main", "All tasks launched — free heap: %u", ESP.getFreeHeap());
 }

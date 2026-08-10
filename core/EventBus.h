@@ -66,6 +66,7 @@ public:
             case EventType::STEPPER_COMMAND:
             case EventType::COMMAND_RECEIVED:
             case EventType::CRED_ROTATE_COMMAND:
+            case EventType::LOCAL_TOKEN_ROTATE_COMMAND:
             case EventType::SYSTEM_RESTART:        return postCommand(e);
             // ── Safety alerts ─────────────────────────────────────
             case EventType::SAFETY_ALERT:          return postAlert(e);

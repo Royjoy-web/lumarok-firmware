@@ -29,7 +29,17 @@
   #define USE_RGB            false
 #endif
 #ifndef USE_I2C_EXPANDER
-  #define USE_I2C_EXPANDER   false
+  // ArduinoDroid has no build_flags mechanism (unlike PlatformIO's
+  // wrover_production env) to set this externally, so it needs a real
+  // default here. On classic/PSRAM boards (e.g. WROVER-E) there is no GPIO
+  // alternative for door/window sensors — default to expecting a PCF8574.
+  // On S3, direct GPIO works, so default off. Override by #define-ing this
+  // above your #include "core/Config.h" line if your wiring differs.
+  #if defined(ARDUINO_ESP32S3_DEV)
+    #define USE_I2C_EXPANDER false
+  #else
+    #define USE_I2C_EXPANDER true
+  #endif
 #endif
 #ifndef DEBUG_MODE
   #define DEBUG_MODE         false
@@ -57,45 +67,113 @@
 #define PIN_GAS_DIGITAL      GPIO_NUM_36
 #define PIN_DHT_SENSOR       GPIO_NUM_39
 #define PIN_POOL_PUMP        GPIO_NUM_2
-#define PIN_US1_TRIG         GPIO_NUM_16  // was GPIO1 (UART TX) — conflict fixed
-#define PIN_US1_ECHO         GPIO_NUM_17  // was GPIO3 (UART RX) — conflict fixed
-// NOTE: US3 was GPIO18/19 — conflicted with PIN_SERVO_BLINDS(18) and PIN_STEPPER_IN2(19).
-// Remapped TRIG to GPIO0 (safe post-boot strapping pin) and ECHO to GPIO34 (input-only,
-// previously free after sensor re-mapping). GPIO2 was rejected — shared with PIN_POOL_PUMP.
-#define PIN_US3_TRIG         GPIO_NUM_0   // was 18 (servo conflict resolved)
-#define PIN_US3_ECHO         GPIO_NUM_34  // BUG-4 fix: was GPIO2 = PIN_POOL_PUMP (conflict)
 
-// BUG-4: guard against future regressions
-static_assert(PIN_US3_ECHO != PIN_POOL_PUMP,
-    "PIN_US3_ECHO and PIN_POOL_PUMP share the same GPIO — remap one of them.");
+// LDR (light sensor) + thermistor (analog temp): GPIO37/38 confirmed free
+// ADC1 pins on WROVER-E — not PSRAM, not flash, not assigned elsewhere.
+// ADC1 stays accurate with WiFi active (unlike ADC2), correct choice here.
+#define PIN_LDR               GPIO_NUM_37
+#define PIN_THERMISTOR        GPIO_NUM_38
+static_assert(PIN_LDR != PIN_THERMISTOR, "PIN_LDR/PIN_THERMISTOR collide.");
+// US1 (living-room occupancy ultrasonic).
+// IMPORTANT: GPIO16/17 are reserved for PSRAM on ESP32-WROVER modules
+// (WROVER-B/E/IE) and cannot be used for any GPIO purpose on those boards —
+// using them risks corrupting PSRAM access, not just "not working". Plain
+// WROOM-32 (no PSRAM) can use 16/17 freely; WROVER cannot.
+// Per the free-GPIO audit (see PIN_US2_TRIG below), classic ESP32 already
+// has zero free GPIOs with the base relay/sensor set alone — so on WROVER
+// there's no alternate pin pair to give US1 without removing something
+// else. US1 is therefore PSRAM-aware: enabled with GPIO16/17 only on
+// confirmed non-PSRAM boards, disabled (no GPIO clash, no silent PSRAM
+// corruption) everywhere else by default.
+#if defined(ARDUINO_ESP32S3_DEV)
+  #define PIN_US1_TRIG         GPIO_NUM_16
+  #define PIN_US1_ECHO         GPIO_NUM_17
+  #define US1_AVAILABLE         1
+#elif defined(BOARD_HAS_PSRAM)
+  // WROVER-B/E/IE or any classic board with PSRAM enabled: 16/17 unusable,
+  // and no free GPIO exists to relocate US1 to.
+  #define PIN_US1_TRIG         GPIO_NUM_0   // placeholder, unused while US1_AVAILABLE=0
+  #define PIN_US1_ECHO         GPIO_NUM_0
+  #define US1_AVAILABLE         0
+#else
+  // Plain WROOM-32 (no PSRAM): 16/17 are real free GPIO.
+  #define PIN_US1_TRIG         GPIO_NUM_16
+  #define PIN_US1_ECHO         GPIO_NUM_17
+  #define US1_AVAILABLE         1
+#endif
+
+// PCF8574 I2C expander — defined here (above the door/window block below) since
+// the classic-ESP32 branch needs these as its PIN_DOOR_SENSOR/PIN_WINDOW_SENSOR values.
+#define PCF8574_ADDR         0x20
+#define PCF8574_PIN_DOOR     0
+#define PCF8574_PIN_WINDOW   1
+
+// US3 (gate obstacle ultrasonic) trigger — safe on both boards (strapping pin, fine post-boot).
+#define PIN_US3_TRIG         GPIO_NUM_0
 
 #if defined(ARDUINO_ESP32S3_DEV)
+  // ── ESP32-S3 branch ────────────────────────────────────────────
+  // Free-GPIO audit (quad-SPI S3-WROOM-1 module, no octal PSRAM/flash on
+  // GPIO26-37): verified unused by the base 14-device pin set above.
+  // Reserved and therefore NOT used below: 19/20 (USB D-/D+), 43/44 (console
+  // UART0), 22-25 (not broken out on WROOM-1), 26-37 (octal PSRAM/flash on
+  // -N16R8 variants — avoided even on quad-SPI boards for portability).
+  #define PIN_US3_ECHO       GPIO_NUM_48  // was GPIO34 — conflicted with PIN_IR_SENSOR
   #define PIN_US2_TRIG       GPIO_NUM_8
   #define PIN_US2_ECHO       GPIO_NUM_9
   #define PIN_DOOR_SENSOR    GPIO_NUM_40
   #define PIN_WINDOW_SENSOR  GPIO_NUM_41
   #define US2_AVAILABLE      1
+  #define US3_AVAILABLE      1
 #else
-  #define PIN_US2_TRIG       GPIO_NUM_4   // NOTE: conflicts with PIN_DOOR_LOCK on non-S3
-  #define PIN_US2_ECHO       GPIO_NUM_34  // was GPIO35 — conflicted with PIN_WINDOW_SENSOR
-  #define PIN_DOOR_SENSOR    GPIO_NUM_36  // was GPIO34 — swapped clear of US2 echo
-  #define PIN_WINDOW_SENSOR  GPIO_NUM_35  // unchanged
-  #define US2_AVAILABLE    0  // Disabled on non-S3: GPIO4 shared with DOOR_LOCK
+  // ── Classic ESP32 (WROOM-32) branch ───────────────────────────
+  // Free-GPIO audit: WROOM-32 exposes 26 usable digital GPIOs (0-5, 12-19,
+  // 21-23, 25-27, 32-39, excluding 6-11 [flash] and 1/3 [UART0 console]).
+  // The base 14-device set above already claims every one of them. There is
+  // ZERO free GPIO left on this board for US2, US3, or direct-GPIO
+  // door/window sensors — this is a hardware ceiling, not a mapping bug.
+  // These features are disabled by default on classic boards. Door/window
+  // MUST go through the PCF8574 I2C expander (USE_I2C_EXPANDER=true); US2
+  // and US3 obstacle/parking ultrasonics are unavailable on this board
+  // without an expander MCU. Do not "free up" a pin by reusing one already
+  // assigned above — every classic-board pin is spoken for.
+  #define PIN_US2_TRIG       GPIO_NUM_0   // placeholder, unused while US2_AVAILABLE=0
+  #define PIN_US2_ECHO       GPIO_NUM_0
+  #define US2_AVAILABLE      0
+  #define US3_AVAILABLE      0   // no free GPIO for PIN_US3_ECHO on this board
+
+  #if !USE_I2C_EXPANDER
+    #error "Classic ESP32 (non-S3): door/window sensors require USE_I2C_EXPANDER=true " \
+"(PCF8574 over I2C). Direct-GPIO door/window pins are not available on this " \
+"board — every GPIO is already assigned to another sensor or actuator. " \
+"Wire a PCF8574 expander and set USE_I2C_EXPANDER=true, or accept that " \
+"door/window sensing is unavailable."
+  #endif
+  #define PIN_DOOR_SENSOR    PCF8574_PIN_DOOR     // expander-only on this board
+  #define PIN_WINDOW_SENSOR  PCF8574_PIN_WINDOW
+#endif
+
+#if US3_AVAILABLE
+static_assert(PIN_US3_ECHO != PIN_POOL_PUMP, "PIN_US3_ECHO conflicts with PIN_POOL_PUMP.");
+static_assert(PIN_US3_ECHO != PIN_IR_SENSOR, "PIN_US3_ECHO conflicts with PIN_IR_SENSOR.");
 #endif
 
 #if USE_RGB
-  #define PIN_RGB_R          GPIO_NUM_25
-  #define PIN_RGB_G          GPIO_NUM_26
-  #define PIN_RGB_B          GPIO_NUM_27
-  // BUG-3 fix: these three GPIOs are shared with safety-critical relay outputs.
-  // Flashing the RGB LED would toggle the geyser, living-room light, and fan relays.
-  #error "USE_RGB=true: GPIO25/26/27 conflict with PIN_GEYSER/PIN_LIVING_LIGHT/PIN_LIVING_FAN. \
-Remap PIN_RGB_* to free GPIOs (e.g. 0, 4, 10 on S3) or leave USE_RGB=false."
+  // Old default (GPIO25/26/27) collided with PIN_GEYSER/PIN_LIVING_LIGHT/PIN_LIVING_FAN —
+  // flashing the status LED would have toggled the geyser and living-room relays.
+  // Remapped to dedicated free pins per board (see free-GPIO audit above).
+  #if defined(ARDUINO_ESP32S3_DEV)
+    #define PIN_RGB_R        GPIO_NUM_1
+    #define PIN_RGB_G        GPIO_NUM_3
+    #define PIN_RGB_B        GPIO_NUM_6
+  #else
+    #error "USE_RGB=true on classic ESP32: no free GPIO remains on this board (see " \
+"free-GPIO audit above PIN_US2_TRIG). Use an S3 board, drive the indicator " \
+"LED over the PCF8574/I2C bus instead, or leave USE_RGB=false."
+  #endif
+  static_assert(PIN_RGB_R != PIN_GEYSER && PIN_RGB_G != PIN_LIVING_LIGHT && PIN_RGB_B != PIN_LIVING_FAN,
+      "PIN_RGB_* still collides with a relay pin — check the assignment above.");
 #endif
-
-#define PCF8574_ADDR         0x20
-#define PCF8574_PIN_DOOR     0
-#define PCF8574_PIN_WINDOW   1
 
 // ── Timing (ms) ───────────────────────────────────────────────
 #define WIFI_TIMEOUT_MS      15000UL
@@ -104,6 +182,7 @@ Remap PIN_RGB_* to free GPIOs (e.g. 0, 4, 10 on S3) or leave USE_RGB=false."
 #define MQTT_RECONNECT_MAX_MS   120000UL
 #define HEARTBEAT_MS         30000UL
 #define SENSOR_READ_MS       10000UL
+#define FINGERPRINT_INTERVAL_MS 500UL   // matches "Fingerprint scan (500ms)" cadence
 #define GAS_CHECK_MS         3000UL
 #define DOOR_CHECK_MS        500UL
 #define IR_CHECK_MS          100UL
@@ -153,8 +232,19 @@ static const esp_task_wdt_config_t WDT_OTA_CONFIG = {
 // ── MQTT Broker ───────────────────────────────────────────────
 #define MQTT_BROKER          "0ff1c4c0eeec4ff18e9b4be04b5a614b.s1.eu.hivemq.cloud"
 #define MQTT_PORT            8883
-#define MQTT_BUFFER_SIZE     4096
+// FIX (heap sync): was 4096 here, already reduced to 2048 in the
+// ArduinoDroid/PC_v3 builds (PubSubClient allocates this from internal
+// heap via setBufferSize() — every KB here is a KB not available for TLS).
+#define MQTT_BUFFER_SIZE     2048
 #define MQTT_KEEPALIVE_S     60
+
+// FIX (heap sync + recalculated): was missing entirely in this build
+// despite being referenced in MQTTTransport.h — undefined-identifier
+// compile error. Value recalculated for this build's reduced mbedTLS
+// buffers (see sdkconfig.defaults) — NOT the same 45000 used in the
+// ArduinoDroid/PC_v3 plain-Arduino builds, which still need the larger
+// value since they can't reduce mbedTLS's default 32KB record buffers.
+#define MQTT_TLS_MIN_FREE_HEAP  22000
 
 // ── NVS Namespaces & Keys ─────────────────────────────────────
 #define NVS_NS_IDENTITY      "lmr_identity"
@@ -170,6 +260,7 @@ static const esp_task_wdt_config_t WDT_OTA_CONFIG = {
 #define NVS_KEY_MQTT_USER    "mqtt_user"
 #define NVS_KEY_MQTT_PASS    "mqtt_pass"
 #define NVS_KEY_DEV_SECRET   "dev_secret"
+#define NVS_KEY_LOCAL_TOKEN  "local_token"   // Phase 1 hardening — LAN-only credential, decoupled from dev_secret
 #define NVS_KEY_BACKEND_URL  "backend_url"
 #define NVS_KEY_AP_PASS      "ap_pass"
 #define NVS_KEY_PROV_LOCKED  "prov_locked"

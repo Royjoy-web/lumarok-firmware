@@ -69,14 +69,20 @@ public:
     // ── Heartbeat / system status ─────────────────────────────
     static void publishHeartbeat() {
         char buf[512];
+        // ip_address: pre-existing gap — Unit.js/handleSystemStatus on the
+        // backend has always expected this field on system/status, firmware
+        // just never sent it. Also doubles as the fallback when mDNS
+        // resolution fails on routers that don't propagate .local properly.
         snprintf(buf, sizeof(buf),
                  "{\"online\":true,\"fw\":\"%s\",\"unit_id\":\"%s\","
-                 "\"uptime\":%lu,\"rssi\":%d,\"heap\":%u,\"ts\":%lu}",
+                 "\"uptime\":%lu,\"rssi\":%d,\"heap\":%u,\"ts\":%lu,"
+                 "\"ip_address\":\"%s\"}",
                  FIRMWARE_VERSION, Identity::get().c_str(),
                  millis() / 1000UL,
                  WiFi.RSSI(),
                  ESP.getFreeHeap(),
-                 (unsigned long)TimeSync::bestEffort());
+                 (unsigned long)TimeSync::bestEffort(),
+                 WiFi.localIP().toString().c_str());
         MQTTTransport::publish(MQTTTopics::sysStatus(), buf, 1, true);
     }
 

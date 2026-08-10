@@ -208,14 +208,22 @@ private:
         _addDevice(MK("outdoor_gate"),       "outdoor",      "gate",        "Gate Motor",              PIN_STEPPER_IN1,     DeviceType::STEPPER, false, 0);
 
         _addSensor(MK("living_room_temperature"), "living_room", "temperature",   "Living Room Temperature", "temperature", PIN_DHT_SENSOR);
+        _addSensor(MK("living_room_light"),        "living_room", "light",         "Living Room Light Level", "light",       PIN_LDR);
+        _addSensor(MK("living_room_thermistor"),   "living_room", "temperature_aux","Living Room Aux Temp",   "temperature", PIN_THERMISTOR);
         _addSensor(MK("living_room_humidity"),    "living_room", "humidity",      "Living Room Humidity",    "humidity",    PIN_DHT_SENSOR);
         _addSensor(MK("kitchen_gas"),             "kitchen",     "gas",           "Kitchen Gas Detector",    "gas",         PIN_GAS_ANALOG);
         _addSensor(MK("outdoor_ir_beam"),         "outdoor",     "ir_beam",       "Gate IR Beam",            "ir",          PIN_IR_SENSOR);
         _addSensor(MK("security_door"),           "security",    "door",          "Main Door Sensor",        "door",        PCF8574_PIN_DOOR);
         _addSensor(MK("security_window"),         "security",    "window",        "Window Sensor",           "window",      PCF8574_PIN_WINDOW);
+#if US1_AVAILABLE
         _addSensor(MK("occupancy_us1"),           "living_room", "occupancy_us1", "Occupancy (US1)",         "occupancy",   PIN_US1_TRIG);
+#endif
+#if US2_AVAILABLE
         _addSensor(MK("parking_us2"),             "outdoor",     "parking_us2",   "Parking Sensor (US2)",    "proximity",   PIN_US2_TRIG);
+#endif
+#if US3_AVAILABLE
         _addSensor(MK("gate_obstacle_us3"),       "outdoor",     "gate_obstacle", "Gate Obstacle (US3)",     "proximity",   PIN_US3_TRIG);
+#endif
 
         #undef MK
     }

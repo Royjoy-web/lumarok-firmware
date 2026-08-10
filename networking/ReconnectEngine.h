@@ -4,10 +4,11 @@
 #include "../core/Config.h"
 #include "../core/EventBus.h"
 #include "../core/RetryPolicy.h"
-#include "../mqtt/MQTTTransport.h"
+
 #include "../security/CredentialStore.h"
 #include "../telemetry/TimeSync.h"
 #include "../storage/FlashWearGuard.h"
+#include "../mqtt/MQTTTransport.h"
 
 // ─────────────────────────────────────────────────────────────
 // ReconnectEngine — manages WiFi and MQTT connection lifecycle.
@@ -52,6 +53,13 @@ public:
         refreshCredentialCache();
 
         WiFi.mode(WIFI_STA);
+        // FIX (power audit): cap TX power. Full 19.5dBm draws current spikes
+        // (~300-500mA) during association/reconnect bursts that can brown out
+        // marginal supplies (e.g. phone USB-OTG power during dev). 15dBm is
+        // ample for typical indoor range and meaningfully reduces peak draw.
+        // Raise back toward WIFI_POWER_19_5dBm if range testing shows drops
+        // once powered from a proper bench/wall supply.
+        WiFi.setTxPower(WIFI_POWER_15dBm);
         WiFi.setAutoReconnect(false);
         WiFi.onEvent(_wifiEvent);
         LOG_I("Reconnect", "Engine initialised");
@@ -91,7 +99,24 @@ public:
 private:
     // ── WiFi state machine ────────────────────────────────────
     static void _tickWiFi() {
-        if (_wifiUp) return;
+        if (_wifiUp)      return;
+        // FIX v4.2.1: Guard against calling WiFi.begin() while a connection
+        // attempt is already in-flight. Without this, the retry timer could
+        // fire before GOT_IP or DISCONNECTED clears _wifiPending, causing a
+        // second WiFi.begin() into an already-connecting stack. The IDF
+        // rejects this with "sta is connecting, cannot set config", and the
+        // overlapping attempts cause the retry loop seen in the serial log
+        // (attempts 2/3/4 firing before attempt 1 had time to resolve).
+        // _wifiPending is cleared by: GOT_IP (success) or DISCONNECTED (fail).
+        if (_wifiPending) return;
+        // FIX (race audit): the v4.2.1 _wifiPending guard above stops the app
+        // layer from double-firing WiFi.begin(), but the ESP-IDF WiFi driver
+        // itself can still be mid-teardown for a short window *after* it has
+        // already posted DISCONNECTED — calling begin() inside that window is
+        // what produces "sta is connecting, cannot set config" even though
+        // _wifiPending was correctly false. A short settle delay after any
+        // disconnect closes that lower-level race.
+        if (millis() - _lastWifiDisconnectMs < 300) return;
         if (!_wifiCB.allowRequest()) return;
         if (!_wifiRetry.ready())     return;
 
@@ -203,8 +228,20 @@ private:
                 TimeSync::init();
                 LOG_I("Reconnect", "WiFi UP — IP: %s  RSSI: %d",
                       WiFi.localIP().toString().c_str(), WiFi.RSSI());
+                LOG_I("HeapDiag", "Internal free right after WiFi connect: %u",
+                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
                 break;
             case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+                // FIX v4.2.1: Clear _wifiPending unconditionally on any disconnect.
+                // Previously this was only cleared inside the `if (_wifiUp)` branch,
+                // meaning a DISCONNECTED during an initial connect attempt (auth fail,
+                // AP busy, wrong password, etc.) left _wifiPending=true permanently.
+                // With the new _tickWiFi guard, that would have deadlocked the
+                // reconnect engine — no further WiFi.begin() would ever fire.
+                // Clearing here regardless of _wifiUp ensures _tickWiFi can schedule
+                // the next retry correctly after any kind of failure.
+                _wifiPending = false;
+                _lastWifiDisconnectMs = millis();
                 if (_wifiUp) {
                     LOG_W("Reconnect", "WiFi disconnected (reason: %d)",
                           (int)info.wifi_sta_disconnected.reason);
@@ -241,6 +278,7 @@ private:
     static bool           _wifiUp;
     static bool           _wifiPending;
     static unsigned long  _wifiConnectStartMs;
+    static unsigned long  _lastWifiDisconnectMs;
     static unsigned long  _lastMqttActivityMs;
     static char           _cachedSSID[64];
     static char           _cachedPass[64];
@@ -254,6 +292,38 @@ inline ConnMetrics    ReconnectEngine::_m                 = {};
 inline bool           ReconnectEngine::_wifiUp            = false;
 inline bool           ReconnectEngine::_wifiPending       = false;
 inline unsigned long  ReconnectEngine::_wifiConnectStartMs= 0;
+inline unsigned long  ReconnectEngine::_lastWifiDisconnectMs= 0;
 inline unsigned long  ReconnectEngine::_lastMqttActivityMs= 0;
 inline char           ReconnectEngine::_cachedSSID[64]    = {};
 inline char           ReconnectEngine::_cachedPass[64]    = {};
+
+// ── MQTTTransport methods that depend on ReconnectEngine ──────────────────
+// Declared in MQTTTransport.h's class body, defined here: this file always
+// includes MQTTTransport.h before this point (see top of file), and by this
+// point ReconnectEngine is also fully defined — so this is the one location
+// guaranteed correct regardless of whether the .ino includes this file or
+// MQTTTransport.h first.
+inline bool MQTTTransport::drainOne() {
+    MQTTPub pub{};
+    if (xQueueReceive(_txQueue, &pub, 0) != pdTRUE) return false;
+    if (!_takeMutex(200)) { xQueueSendToFront(_txQueue, &pub, 0); return false; }
+    bool connected = _client->connected();
+    bool ok = connected && _client->publish(pub.topic, pub.payload, pub.retain);
+    _giveMutex();
+    if (ok)            ReconnectEngine::notifyMQTTActivity();
+    else if (!connected) xQueueSendToFront(_txQueue, &pub, 0);
+    else               LOG_W("MQTT", "Publish failed: %s", pub.topic);
+    return ok;
+}
+
+inline void MQTTTransport::_incomingCallback(const char* topic,
+                                              uint8_t* payload, unsigned int len) {
+    ReconnectEngine::notifyMQTTActivity();
+    for (uint8_t i = 0; i < _subCount; i++) {
+        if (_topicMatches(_subs[i].topic, topic)) {
+            _subs[i].callback(topic, payload, len);
+            return;
+        }
+    }
+    LOG_W("MQTT", "Unrouted topic: %s", topic);
+}

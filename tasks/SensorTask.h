@@ -1,3 +1,5 @@
+// ⚠️ DEPRECATED — superseded by the V2 module. Not included in any .ino build (see includes). Kept only for reference; safe to ignore/remove in a future cleanup PR.
+
 #pragma once
 #include "../core/TaskManager.h"
 #include "../core/EventBus.h"

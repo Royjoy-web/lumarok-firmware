@@ -69,6 +69,15 @@ struct CredRotateCommand {
     long ts;
 };
 
+// Phase 1 hardening — local_token pairing. Delivered over its own MQTT
+// topic (LocalTokenProvisioner), signed with dev_secret same as cred-rotate,
+// but only ever touches local_token — never mqtt creds or dev_secret itself.
+struct LocalTokenCommand {
+    char token[65];
+    char sig[65];
+    long ts;
+};
+
 // ── OTA ───────────────────────────────────────────────────────
 struct OTACommand {
     char url[256];
@@ -106,6 +115,7 @@ enum class EventType : uint8_t {
     OTA_COMMAND,
     OTA_PROGRESS,
     CRED_ROTATE_COMMAND,
+    LOCAL_TOKEN_ROTATE_COMMAND,
     SYSTEM_RESTART,
     HEARTBEAT_TICK,
     CRASH_RECOVERED,
@@ -126,6 +136,7 @@ struct Event {
         DeviceCommand       command;
         OTACommand          ota;
         CredRotateCommand   cred_rotate;
+        LocalTokenCommand   local_token;
         Alert               alert;
         NetworkInfo         net;
         MQTTStatus          mqtt_status;

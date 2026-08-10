@@ -1,6 +1,7 @@
 #pragma once
 #include "../core/TaskManager.h"
 #include "../core/BootManager.h"
+#include "../diagnostics/FaultManager.h"
 
 // ── V2 task entry point declarations ─────────────────────────
 void networkTaskFnV2    (void*);

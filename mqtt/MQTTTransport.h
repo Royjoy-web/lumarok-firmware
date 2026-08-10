@@ -2,18 +2,33 @@
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
 #include <freertos/queue.h>
+#include "esp_heap_caps.h"
 #include "../core/Types.h"
 #include "../core/Config.h"
 #include "../core/EventBus.h"
 #include "../core/Identity.h"
 #include "../mqtt/MQTTTopics.h"
 #include "../security/CredentialStore.h"
-#include "../networking/ReconnectEngine.h"
 
-// MQTTPub payload cap: largest real payload is the diagnostics JSON (~896 bytes).
-// 1024 bytes gives comfortable headroom and fits well within MQTT_BUFFER_SIZE (4096).
-#define MQTT_PUB_PAYLOAD_MAX 1024
-#define MQTT_TX_QUEUE_DEPTH  16   // 16 × ~608 bytes ≈ 9.5 KB
+// MQTTPub payload cap.
+// BUG FOUND during heap-audit sanity pass: BatchPublisher.h builds batch
+// JSON up to BATCH_PAYLOAD_SIZE (1536 bytes) and hands it to publish(),
+// which strlcpy's it into this fixed buffer. The old cap here (1024) was
+// SMALLER than BatchPublisher's own payload — any batch of 8 readings that
+// actually filled its buffer was silently truncated to 1023 bytes by
+// strlcpy, producing malformed/unterminated JSON on the broker side.
+// Raised to cover BATCH_PAYLOAD_SIZE + slack for topic/framing.
+#define MQTT_PUB_PAYLOAD_MAX 1600
+// Queue depth: previously reduced 16→8 to compensate for the larger
+// per-slot payload from the truncation fix above. Further reduced 8→4
+// during the heap-audit heap-diagnostic pass — measured cost of this
+// queue+buffer was ~14.35KB of internal RAM (sizeof(MQTTPub)*depth +
+// MQTT_BUFFER_SIZE), a meaningful chunk of the gap to MQTT_TLS_MIN_FREE_HEAP.
+// BatchPublisher already coalesces up to 8 readings into one publish EVENT
+// — this queue holds pending publish events (batches/heartbeats/faults),
+// not individual readings, so depth=4 is still generous headroom for
+// normal bursts (e.g. a fault firing right as a batch flushes).
+#define MQTT_TX_QUEUE_DEPTH  4
 
 struct MQTTPub {
     char    topic[96];
@@ -84,6 +99,21 @@ public:
         }
         if (!_backoffExpired()) return false;
 
+        // FIX (heap audit): mbedTLS needs a large contiguous internal-DRAM
+        // block for the TLS handshake (RX+TX record buffers + cert parsing).
+        // PSRAM cannot help here — TLS buffers must live in internal RAM.
+        // Without this check, an under-provisioned attempt fails deep inside
+        // WiFiClientSecure and surfaces only as an opaque PubSubClient
+        // rc=-2, indistinguishable from a real network/broker problem.
+        size_t freeInternal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        if (freeInternal < MQTT_TLS_MIN_FREE_HEAP) {
+            LOG_W("MQTT", "Skipping connect — internal heap %u < %u, TLS would fail",
+                  (unsigned)freeInternal, (unsigned)MQTT_TLS_MIN_FREE_HEAP);
+            _backoffRetry++;
+            _backoffStartMs = millis();
+            return false;
+        }
+
         String user = CredentialStore::mqttUser();
         String pass = CredentialStore::mqttPass();
         String cid  = Identity::mqttClientId();
@@ -123,6 +153,14 @@ public:
         } else {
             _backoffRetry++;
             LOG_W("MQTT", "Failed (rc=%d, retry=%d)", _client->state(), (int)_backoffRetry);
+            // FIX (heap leak): a failed connect() can leave a partially-built
+            // mbedTLS session (handshake buffers, cert parsing state) behind
+            // on _secureClient. Without stopping it explicitly, that memory
+            // isn't released before the next retry — internal heap trends
+            // down across repeated failures instead of recovering. Must be
+            // called outside the mutex we already released above (stop()
+            // can block briefly on socket teardown).
+            _secureClient.stop();
         }
         return ok;
     }
@@ -159,18 +197,8 @@ public:
     }
 
     // Direct publish — MQTTTxTask only, mutex-protected
-    static bool drainOne() {
-        MQTTPub pub{};
-        if (xQueueReceive(_txQueue, &pub, 0) != pdTRUE) return false;
-        if (!_takeMutex(200)) { xQueueSendToFront(_txQueue, &pub, 0); return false; }
-        bool connected = _client->connected();
-        bool ok = connected && _client->publish(pub.topic, pub.payload, pub.retain);
-        _giveMutex();
-        if (ok)            ReconnectEngine::notifyMQTTActivity();
-        else if (!connected) xQueueSendToFront(_txQueue, &pub, 0);
-        else               LOG_W("MQTT", "Publish failed: %s", pub.topic);
-        return ok;
-    }
+    // NOTE: body moved below ReconnectEngine include to resolve circular dependency
+    static bool drainOne();
 
     // ── Subscription Registry ─────────────────────────────────
     // FIX v3.2: _subs[] is now written inside _clientMutex.
@@ -252,18 +280,9 @@ private:
     static void _giveMutex() { xSemaphoreGive(_clientMutex); }
 
     // Invoked from _client->loop() while _clientMutex is held.
-    // MUST NOT call any MQTTTransport method that acquires _clientMutex.
+    // NOTE: body moved below ReconnectEngine include to resolve circular dependency
     static void _incomingCallback(const char* topic,
-                                   uint8_t* payload, unsigned int len) {
-        ReconnectEngine::notifyMQTTActivity();
-        for (uint8_t i = 0; i < _subCount; i++) {
-            if (_topicMatches(_subs[i].topic, topic)) {
-                _subs[i].callback(topic, payload, len);
-                return;
-            }
-        }
-        LOG_W("MQTT", "Unrouted topic: %s", topic);
-    }
+                                   uint8_t* payload, unsigned int len);
 
     static bool _topicMatches(const char* filter, const char* topic) {
         while (*filter && *topic) {
@@ -308,3 +327,12 @@ inline uint8_t             MQTTTransport::_subCount      = 0;
 inline uint32_t            MQTTTransport::_reconnectCount = 0;
 inline uint8_t             MQTTTransport::_backoffRetry  = 0;
 inline unsigned long       MQTTTransport::_backoffStartMs = 0;
+
+// drainOne() and _incomingCallback() are declared above (in the class body)
+// but defined in ReconnectEngine.h, not here — both call
+// ReconnectEngine::notifyMQTTActivity(), and ReconnectEngine.h is the one
+// file guaranteed to see both classes fully defined regardless of which of
+// these two headers the .ino happens to include first (it always includes
+// MQTTTransport.h itself before defining ReconnectEngine). See
+// ../networking/ReconnectEngine.h for the actual definitions.
+

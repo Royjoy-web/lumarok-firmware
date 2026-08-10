@@ -34,8 +34,9 @@ public:
         LOG_I("AP", "AP provisioning stopped");
     }
 
-    static void tick() {
+    static bool tick() {
         if (_active && _server) _server->handleClient();
+        return _success;
     }
 
     static bool isActive()  { return _active; }

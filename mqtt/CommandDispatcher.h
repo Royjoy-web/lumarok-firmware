@@ -7,6 +7,10 @@
 #include "../security/HMACVerifier.h"
 #include "../security/CredentialStore.h"
 #include "../telemetry/TimeSync.h"
+// Phase 2 driver headers — only included when features are enabled
+#include "Phase2Drivers.h"
+#include "../drivers/IRTransmitter.h"
+#include "../drivers/FingerprintDriver.h"
 
 class CommandDispatcher {
 public:
@@ -20,7 +24,7 @@ public:
 private:
     // ── Device command: lumarok/{id}/{room}/{device}/command ──
     static void _onDeviceCommand(const char* topic, const uint8_t* raw, unsigned int len) {
-        StaticJsonDocument<256> doc;
+        StaticJsonDocument<384> doc;
         if (deserializeJson(doc, raw, len) != DeserializationError::Ok) return;
 
         char room[24] = {}, devName[32] = {};
@@ -32,6 +36,24 @@ private:
 
         const char* action = doc["action"] | "";
         int         value  = doc["value"]  | -1;
+        const char* sig    = doc["sig"]    | "";
+        long        ts     = doc["ts"]     | 0L;
+
+        // ── Auth: HMAC-SHA256 + 5-min timestamp window ────────
+        // Canonical message: "action:room:device:ts"
+        // Backend signs with dev_secret; commands without a valid sig are dropped.
+        // (Restored — this check was present in the original device-command path
+        // but missing from a prior revision of this file. Every other command
+        // class here — system, cred-rotate, OTA — already enforces it; device
+        // commands toggle relays including the geyser and door lock, so the gap
+        // would have let an unauthenticated MQTT publish flip those directly.)
+        if (!_validateTimestamp(ts)) return;
+        String msg = HMACVerifier::buildDeviceCommandMessage(action, room, devName, ts);
+        if (!HMACVerifier::verify(msg, CredentialStore::devSecret(), sig)) {
+            LOG_W("Cmd", "Device command HMAC invalid — dropped (%s/%s action=%s)",
+                  room, devName, action);
+            return;
+        }
 
         CommandAction ca;
         if      (strcmp(action, "on")     == 0) ca = CommandAction::ON;
@@ -70,6 +92,66 @@ private:
             return;
         }
 
+#if ENABLE_RGBW
+        if (strcmp(cmd, "rgbw_set") == 0) {
+            RGBWDriver::dispatchMQTT(doc["action"]|"color",
+                strtoul(doc["hex"]|"FFFFFF",nullptr,16),
+                doc["white"]|0, doc["scene"]|"");
+            return;
+        }
+#endif
+#if ENABLE_HVAC
+        if (strcmp(cmd, "hvac_set") == 0) {
+            HVACController::setMode(
+                (HVACController::Mode)(uint8_t)(doc["mode"]|0),
+                doc["setpoint"]|22, doc["fan"]|1);
+            return;
+        }
+#endif
+#if ENABLE_MULTIMODAL
+        if (strcmp(cmd, "guest_pin_set") == 0) {
+            MultiModalAuth::storeGuestPIN(doc["pin"]|"",
+                doc["valid_from"]|0UL, doc["valid_until"]|0UL, doc["max_uses"]|1UL);
+            return;
+        }
+        if (strcmp(cmd, "guest_pin_revoke") == 0) {
+            MultiModalAuth::revokeGuestPIN(doc["pin"]|"");
+            return;
+        }
+#endif
+#if ENABLE_IR_TX || ENABLE_HVAC
+        if (strcmp(cmd, "ir_send_nec") == 0) {
+            IRTransmitter::sendNEC((uint64_t)strtoul(doc["code"]|"0",nullptr,16), doc["bits"]|32);
+            return;
+        }
+#endif
+#if ENABLE_HVAC
+        if (strcmp(cmd, "ir_send_ac") == 0) {
+            IRTransmitter::ACCommand ac{};
+            strlcpy(ac.protocol, doc["protocol"]|"DAIKIN", sizeof(ac.protocol));
+            ac.temp=doc["temp"]|22; ac.mode=doc["mode"]|0; ac.fan=doc["fan"]|0;
+            ac.power=doc["power"]|true; ac.swing=doc["swing"]|false;
+            IRTransmitter::sendAC(ac); return;
+        }
+#endif
+#if ENABLE_FINGERPRINT
+        if (strcmp(cmd, "fp_enroll") == 0) {
+            uint8_t slot=(uint8_t)(doc["slot"]|1);
+            bool ok=FingerprintDriver::enroll(slot);
+            char resp[80]; snprintf(resp,sizeof(resp),"{\"cmd\":\"fp_enroll_result\",\"slot\":%d,\"ok\":%s}",slot,ok?"true":"false");
+            MQTTTransport::publish((String("lumarok/")+Identity::get()+"/events").c_str(),resp);
+            return;
+        }
+        if (strcmp(cmd, "fp_delete") == 0) {
+            FingerprintDriver::deleteTemplate((uint8_t)(doc["slot"]|1)); return;
+        }
+#endif
+#if ENABLE_PZEM
+        if (strcmp(cmd, "pzem_reset_kwh") == 0) {
+            PZEM004TDriver::resetEnergy();
+            LOG_I("CMD","PZEM kWh reset"); return;
+        }
+#endif
         LOG_W("Cmd", "Unknown system command: %s", cmd);
     }
 

@@ -28,6 +28,8 @@ public:
                  "lumarok/%s/ota/progress", unitId.c_str());
         snprintf(_cmdSub,       sizeof(_cmdSub),
                  "lumarok/%s/+/+/command",  unitId.c_str());
+        snprintf(_pairingSub,   sizeof(_pairingSub),
+                 "lumarok/%s/pairing",      unitId.c_str());
         snprintf(_diagnostics,  sizeof(_diagnostics),
                  "lumarok/%s/system/diagnostics", unitId.c_str());
         snprintf(_relayState,   sizeof(_relayState),
@@ -51,6 +53,9 @@ public:
     static const char* cmdSubscribe()  { return _cmdSub;    }
     static const char* otaSubscribe()  { return _otaUpdate; }
     static const char* sysSubscribe()  { return _sysCmd;    }
+    // Phase 1 hardening — own topic, own subscription, kept out of
+    // CommandDispatcher entirely so the cloud command path stays untouched.
+    static const char* pairingSubscribe() { return _pairingSub; }
 
     // LWT topic + payload (MQTT client registers at connect time)
     static const char* lwtTopic()   { return _sysStatus; }
@@ -109,6 +114,7 @@ private:
     static char   _otaUpdate[80];
     static char   _otaProgress[80];
     static char   _cmdSub[80];
+    static char   _pairingSub[80];
     static char   _diagnostics[80];
     static String _unitId;
 };
@@ -122,6 +128,7 @@ inline char   MQTTTopics::_sysCmd[80]       = {};
 inline char   MQTTTopics::_otaUpdate[80]    = {};
 inline char   MQTTTopics::_otaProgress[80]  = {};
 inline char   MQTTTopics::_cmdSub[80]       = {};
+inline char   MQTTTopics::_pairingSub[80]   = {};
 inline char   MQTTTopics::_diagnostics[80]  = {};
 inline char   MQTTTopics::_relayState[80]   = {};
 inline String MQTTTopics::_unitId;

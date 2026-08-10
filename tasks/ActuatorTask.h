@@ -9,6 +9,7 @@
 #include "../telemetry/TelemetryPipeline.h"
 #include "../provisioning/ProvisioningManager.h"
 #include "../storage/NVSStore.h"
+#include "../security/CredentialStore.h"
 
 // _applyRelay — atomically updates registry state under lock,
 // then performs GPIO write and telemetry publish OUTSIDE the lock.
@@ -135,6 +136,14 @@ void actuatorTaskFn(void* pvParam) {
                 e.data.cred_rotate.mqtt_pass,
                 e.data.cred_rotate.dev_secret);
             MQTTTransport::disconnect();
+
+        } else if (e.type == EventType::LOCAL_TOKEN_ROTATE_COMMAND) {
+            // HMAC already verified in LocalTokenProvisioner before this was
+            // posted — same trust boundary as CRED_ROTATE_COMMAND above.
+            // No MQTT disconnect needed: local_token never touches the
+            // cloud MQTT session, only LocalCommandServer's HMAC check.
+            CredentialStore::storeLocalToken(e.data.local_token.token);
+            LOG_I("Actuator", "local_token stored — unit now paired for LAN control");
 
         } else if (e.type == EventType::SYSTEM_RESTART) {
             LOG_I("Actuator", "Restart command received");

@@ -15,6 +15,7 @@
 #include "../diagnostics/FaultManager.h"
 #include "../diagnostics/WatchdogManager.h"
 
+#ifndef SENSOR_TASK_P2_ACTIVE
 void sensorTaskFnV2(void* pvParam) {
     int8_t wdIdx = WatchdogManager::registerTask("SensorTask", 20000);
 
@@ -117,3 +118,4 @@ void sensorTaskFnV2(void* pvParam) {
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
+#endif // SENSOR_TASK_P2_ACTIVE

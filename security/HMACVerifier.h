@@ -48,6 +48,13 @@ public:
         return mqttUser + ":" + mqttPass + ":" + devSecret + ":" + String(ts);
     }
 
+    // Build the canonical message string for per-device commands
+    // (relay/servo/stepper on/off/toggle/set). Format: "action:room:device:ts"
+    static String buildDeviceCommandMessage(const String& action, const String& room,
+                                             const String& device, long ts) {
+        return action + ":" + room + ":" + device + ":" + String(ts);
+    }
+
 private:
     static bool _computeHMAC(const String& msg, const String& key, uint8_t out[32]) {
         const mbedtls_md_info_t* info =
